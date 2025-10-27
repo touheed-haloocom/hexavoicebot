@@ -1,0 +1,7 @@
+{
+  "name": "Hexa Voice voice  Bot",
+  "description": "An awesome voice bot application with a futuristic hexagonal UI, powered by the Gemini Live API for real-time, natural conversations.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
