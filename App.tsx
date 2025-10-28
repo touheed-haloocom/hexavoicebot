@@ -1,3 +1,5 @@
+
+
 import React, { useRef, useEffect, useState } from 'react';
 import { useHexaVoice } from './hooks/useHexaVoice';
 import { BotStatus, Conversation } from './types';
@@ -24,7 +26,8 @@ const HistoryPanel: React.FC<HistoryPanelProps> = ({
   startNewConversation,
   deleteConversation,
 }) => {
-  const sortedConversations = Object.values(conversations).sort((a, b) => b.timestamp - a.timestamp);
+  // FIX: Add explicit types to sort callback to resolve 'unknown' type error.
+  const sortedConversations = Object.values(conversations).sort((a: Conversation, b: Conversation) => b.timestamp - a.timestamp);
 
   const handleStartNew = () => {
     startNewConversation();
@@ -61,7 +64,8 @@ const HistoryPanel: React.FC<HistoryPanelProps> = ({
           </div>
           <div className="flex-grow overflow-y-auto p-4 space-y-2">
             {sortedConversations.length > 0 ? (
-              sortedConversations.map(convo => (
+              // FIX: Add explicit type to `convo` to resolve property access errors.
+              sortedConversations.map((convo: Conversation) => (
                 <div
                   key={convo.id}
                   onClick={() => handleLoad(convo.id)}
@@ -161,6 +165,8 @@ const App: React.FC = () => {
         return 'Speaking...';
       case BotStatus.SINGING:
         return 'Performing...';
+      case BotStatus.RECOVERING:
+        return 'Just a moment, fixing a glitch...';
       case BotStatus.GENERATING_AUDIO:
         return 'Generating audio file...';
       default:
@@ -209,6 +215,8 @@ const App: React.FC = () => {
         return "Type a message...";
       case BotStatus.THINKING:
         return "Hexa is generating a response...";
+      case BotStatus.RECOVERING:
+        return "Attempting to recover...";
       case BotStatus.ERROR:
         return "An error occurred. You can type a new message.";
       default:

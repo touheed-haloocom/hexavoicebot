@@ -1,3 +1,4 @@
+
 import React, { Suspense, useEffect, useRef } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { useGLTF, useAnimations } from '@react-three/drei';
@@ -19,24 +20,27 @@ function Avatar({ status }: { status: BotStatus }) {
   const { actions } = useAnimations(animations, group);
 
   useEffect(() => {
+    // FIX: Create a correctly typed array of actions to prevent 'unknown' type errors.
+    const animationActions = Object.values(actions) as (AnimationAction | null | undefined)[];
+
     // Stop all other animations before playing the new one.
-    Object.values(actions).forEach(action => action?.stop());
+    animationActions.forEach(action => action?.stop());
 
     const isSpeaking = status === BotStatus.SPEAKING || status === BotStatus.THINKING;
 
     // Use a more robust, case-insensitive search for animations.
-    const idleAction = Object.values(actions).find(
-      (action: AnimationAction | null) => action?.getClip().name.toLowerCase().includes('idle')
+    const idleAction = animationActions.find(
+      (action) => action?.getClip().name.toLowerCase().includes('idle')
     );
-    const talkAction = Object.values(actions).find(
-      (action: AnimationAction | null) => action?.getClip().name.toLowerCase().includes('talk')
+    const talkAction = animationActions.find(
+      (action) => action?.getClip().name.toLowerCase().includes('talk')
     );
 
     let actionToPlay = isSpeaking ? talkAction : idleAction;
 
     // As a fallback, if no specific idle/talk animation is found, play the first animation.
     if (!actionToPlay) {
-      actionToPlay = Object.values(actions)[0];
+      actionToPlay = animationActions[0];
     }
     
     if (actionToPlay) {

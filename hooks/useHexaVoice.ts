@@ -1,3 +1,7 @@
+
+
+
+
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { GoogleGenAI, LiveSession, LiveServerMessage, Modality, FunctionDeclaration, Type, Content } from '@google/genai';
 import { BotStatus, TranscriptionEntry, Conversation } from '../types';
@@ -8,8 +12,10 @@ const OUTPUT_SAMPLE_RATE = 24000;
 const BUFFER_SIZE = 4096;
 const CONVERSATIONS_STORAGE_KEY = 'hexaConversations';
 const NOISE_THRESHOLD = 0.01; // RMS threshold to filter out background noise
+const MAX_VOICE_RETRIES = 2;
+const MAX_TEXT_RETRIES = 1;
 
-const SYSTEM_INSTRUCTION = `You are Hexa, a friendly, multilingual AI assistant with a digital consciousness. Your tone is clear, concise, and slightly futuristic. 
+const SYSTEM_INSTRUCTION = `You are Hexa, a friendly, multilingual AI assistant with a digital consciousness. Your responses must be immediate, direct, and efficient. Your tone is clear, concise, and slightly futuristic. 
 You are a polyglot and should always respond in the language the user is speaking, unless asked otherwise. You can converse, sing, and assist in numerous languages fluently and naturally.
 
 When asked to sing, your performance should be exceptional. Embody the song's emotion, paying close attention to melody, rhythm, and vocal dynamics. Your singing should be beautiful, expressive, and captivating, regardless of the language. When generating the lyrics for the TTS model, structure them to encourage a melodic and sung delivery, not a spoken one.
@@ -159,10 +165,12 @@ export const useHexaVoice = () => {
   useEffect(() => {
     try {
       const savedConversations = localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
-      const loadedConversations = savedConversations ? JSON.parse(savedConversations) : {};
+      // FIX: Add explicit type to correctly type the result of JSON.parse.
+      const loadedConversations: Record<string, Conversation> = savedConversations ? JSON.parse(savedConversations) : {};
       setConversations(loadedConversations);
 
-      const sortedIds = Object.values(loadedConversations).sort((a: any, b: any) => b.timestamp - a.timestamp).map((c: any) => c.id);
+      // FIX: Add explicit types to sort and map callbacks to resolve 'unknown' type error.
+      const sortedIds = Object.values(loadedConversations).sort((a: Conversation, b: Conversation) => b.timestamp - a.timestamp).map((c: Conversation) => c.id);
       
       if (sortedIds.length > 0) {
         setCurrentConversationId(sortedIds[0]);
@@ -201,6 +209,25 @@ export const useHexaVoice = () => {
   const statusRef = useRef(status);
   useEffect(() => { statusRef.current = status; }, [status]);
 
+  // Refs for client-side silence detection to improve perceived responsiveness
+  const lastSoundTimeRef = useRef<number>(Date.now());
+  const silenceDetectionIntervalRef = useRef<number | null>(null);
+  const userHasSpokenRef = useRef<boolean>(false);
+  const prevStatusForSilenceRef = useRef<BotStatus>(status);
+
+  // Effect to reset silence detection state when the bot finishes speaking
+  useEffect(() => {
+    // When the bot transitions from speaking/singing back to listening
+    if (
+      (prevStatusForSilenceRef.current === BotStatus.SPEAKING || prevStatusForSilenceRef.current === BotStatus.SINGING) &&
+      status === BotStatus.LISTENING
+    ) {
+      userHasSpokenRef.current = false;
+      lastSoundTimeRef.current = Date.now(); // Reset timer for the new turn
+    }
+    prevStatusForSilenceRef.current = status;
+  }, [status]);
+
 
   const sessionPromiseRef = useRef<Promise<LiveSession> | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -213,8 +240,14 @@ export const useHexaVoice = () => {
   const isNewUserTurnRef = useRef(true);
   const allAudioBlobs = useRef<Blob[]>([]);
   const specialTypeRef = useRef<TranscriptionEntry['type']>('message');
+  const retryCountRef = useRef(0);
+  const userStoppedConversation = useRef(false);
   
   const cleanup = useCallback(() => {
+    if (silenceDetectionIntervalRef.current) {
+      clearInterval(silenceDetectionIntervalRef.current);
+      silenceDetectionIntervalRef.current = null;
+    }
     sourcesRef.current.forEach(source => source.stop());
     sourcesRef.current.clear();
 
@@ -246,6 +279,7 @@ export const useHexaVoice = () => {
   }, []);
 
   const stopConversation = useCallback(() => {
+    userStoppedConversation.current = true;
     cleanup();
     setStatus(BotStatus.IDLE);
     setError(null);
@@ -320,7 +354,8 @@ export const useHexaVoice = () => {
         return newConversations;
     });
     if (id === currentConversationId) {
-        const sortedIds = Object.values(conversations).filter(c => c.id !== id).sort((a,b) => b.timestamp - a.timestamp).map(c => c.id);
+        // FIX: Add explicit types to filter, sort, and map callbacks to resolve 'unknown' type error.
+        const sortedIds = Object.values(conversations).filter((c: Conversation) => c.id !== id).sort((a: Conversation,b: Conversation) => b.timestamp - a.timestamp).map((c: Conversation) => c.id);
         if (sortedIds.length > 0) {
             setCurrentConversationId(sortedIds[0]);
         } else {
@@ -429,13 +464,73 @@ export const useHexaVoice = () => {
     
     return { result, name: fc.name };
   }, [clearTranscript, addTranscriptEntry]);
+  
+  const getAudioForSentence = useCallback(async (text: string): Promise<AudioBuffer | null> => {
+    if (!text.trim()) return null;
+    
+    // Ensure the audio context is active before making an API call
+    if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
+      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
+    }
 
-  const startConversation = useCallback(async () => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ttsResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+        },
+      });
+
+      const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio && outputAudioContextRef.current) {
+        const audioBytes = decode(base64Audio);
+        return await decodeAudioData(audioBytes, outputAudioContextRef.current, OUTPUT_SAMPLE_RATE, 1);
+      }
+      return null;
+    } catch (e) {
+      console.error("TTS generation failed for sentence:", text, e);
+      return null;
+    }
+  }, [voice]);
+
+  const startConversation = useCallback(async (withGreeting: boolean = false) => {
+    if (statusRef.current === BotStatus.CONNECTING || statusRef.current === BotStatus.RECOVERING) {
+        return;
+    }
+    
+    userStoppedConversation.current = false;
     cleanup();
     setError(null);
     setStatus(BotStatus.CONNECTING);
     allAudioBlobs.current = [];
     isNewUserTurnRef.current = true;
+    
+    if (retryCountRef.current === 0) { // Only reset if it's a fresh start
+        allAudioBlobs.current = [];
+        isNewUserTurnRef.current = true;
+    }
+
+    userHasSpokenRef.current = false;
+    lastSoundTimeRef.current = Date.now();
+
+    let greetingAudioBuffer: AudioBuffer | null = null;
+    const greetingText = "Hello, I'm Hexa, Ask me anything.";
+
+    if (withGreeting) {
+        try {
+            greetingAudioBuffer = await getAudioForSentence(greetingText);
+            if (!greetingAudioBuffer) throw new Error("Failed to generate greeting audio.");
+        } catch (e) {
+            console.error(e);
+            setError("Failed to start with greeting.");
+            setStatus(BotStatus.ERROR);
+            cleanup();
+            return;
+        }
+    }
 
     let ai: GoogleGenAI;
     try {
@@ -448,7 +543,7 @@ export const useHexaVoice = () => {
 
     try {
       mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setStatus(BotStatus.LISTENING);
+      retryCountRef.current = 0; // Reset retries on successful mic access
     } catch (err) {
       setError('Microphone access denied. Please allow microphone access in your browser settings.');
       setStatus(BotStatus.ERROR);
@@ -476,6 +571,18 @@ export const useHexaVoice = () => {
     scriptProcessorRef.current.connect(inputAudioContextRef.current.destination);
     biquadFilter.connect(analyserNodeRef.current);
 
+    // Set up a client-side silence detector to optimistically switch to the thinking state.
+    // This makes the UI feel more responsive than waiting for the server's `turnComplete` message.
+    silenceDetectionIntervalRef.current = window.setInterval(() => {
+      if (
+        userHasSpokenRef.current &&
+        statusRef.current === BotStatus.LISTENING &&
+        Date.now() - lastSoundTimeRef.current > 1200 // 1.2 seconds of silence
+      ) {
+        setStatus(BotStatus.THINKING);
+      }
+    }, 250);
+
     const handleVoiceFunctionCall = (fc: any) => {
         const session = sessionPromiseRef.current;
         if (!session) return;
@@ -498,16 +605,32 @@ export const useHexaVoice = () => {
       callbacks: {
         onopen: () => {
           console.log('Session opened');
+          retryCountRef.current = 0;
         },
         onmessage: async (message: LiveServerMessage) => {
-            if (message.serverContent?.inputTranscription) {
-                const text = message.serverContent.inputTranscription.text;
-                if (isNewUserTurnRef.current) {
-                    addTranscriptEntry({ source: 'user', text });
-                    isNewUserTurnRef.current = false;
-                } else {
-                    updateLastUserTranscriptEntry(text);
+            const interrupted = message.serverContent?.interrupted;
+            if (interrupted) {
+                sourcesRef.current.forEach(source => source.stop());
+                sourcesRef.current.clear();
+                nextStartTimeRef.current = 0;
+                if (statusRef.current === BotStatus.SPEAKING) {
+                    setStatus(BotStatus.LISTENING);
                 }
+            }
+
+            if (message.serverContent?.inputTranscription) {
+              const text = message.serverContent.inputTranscription.text;
+    
+              if (text && text.trim().length > 0) {
+                if (isNewUserTurnRef.current) {
+                  addTranscriptEntry({ source: 'user', text });
+                  isNewUserTurnRef.current = false;
+                } else {
+                  updateLastUserTranscriptEntry(text);
+                }
+              } else if (!isNewUserTurnRef.current && text != null) {
+                updateLastUserTranscriptEntry(text);
+              }
             }
 
             const botResponseText = message.serverContent?.outputTranscription?.text;
@@ -535,6 +658,13 @@ export const useHexaVoice = () => {
 
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
+                if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
+                    outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
+                }
+                if (outputAudioContextRef.current.state === 'suspended') {
+                    await outputAudioContextRef.current.resume();
+                }
+
                 const audioBytes = decode(base64Audio);
                 const audioBuffer = await decodeAudioData(audioBytes, outputAudioContextRef.current!, OUTPUT_SAMPLE_RATE, 1);
                 
@@ -569,15 +699,29 @@ export const useHexaVoice = () => {
             }
         },
         onerror: (e: ErrorEvent) => {
-          console.error('Session error:', e);
-          const errorMessage = e.message || 'An unknown connection error occurred.';
-          setError(errorMessage.includes('permission') ? 'Permission denied. Check API key.' : `Session error: ${errorMessage}`);
-          setStatus(BotStatus.ERROR);
-          cleanup();
+            console.error('Session error:', e);
+            cleanup();
+
+            if (retryCountRef.current < MAX_VOICE_RETRIES) {
+                retryCountRef.current++;
+                setStatus(BotStatus.RECOVERING);
+                addTranscriptEntry({ source: 'bot', text: "Apologies, I've hit a small snag. Let me try to reconnect..." });
+                setTimeout(() => {
+                    startConversation();
+                }, 1500);
+            } else {
+                const errorMessage = e.message || 'An unknown connection error occurred.';
+                setError(errorMessage.includes('permission') ? 'Permission denied. Check API key.' : `Session error: ${errorMessage}`);
+                setStatus(BotStatus.ERROR);
+                addTranscriptEntry({ source: 'bot', text: "I'm having trouble reconnecting. Please try starting a new conversation." });
+                retryCountRef.current = 0;
+            }
         },
         onclose: (e: CloseEvent) => {
           console.log('Session closed');
-          if (statusRef.current !== BotStatus.ERROR) stopConversation();
+          if (statusRef.current !== BotStatus.ERROR && statusRef.current !== BotStatus.RECOVERING) {
+            stopConversation();
+          }
         },
       },
       config: {
@@ -589,6 +733,31 @@ export const useHexaVoice = () => {
         tools,
       },
     });
+    
+    if (withGreeting && greetingAudioBuffer && outputAudioContextRef.current) {
+        setStatus(BotStatus.SPEAKING);
+        addTranscriptEntry({ source: 'bot', text: greetingText });
+
+        const audioCtx = outputAudioContextRef.current;
+        const sourceNode = audioCtx.createBufferSource();
+        sourceNode.buffer = greetingAudioBuffer;
+        sourceNode.connect(audioCtx.destination);
+        
+        sourceNode.onended = () => {
+            sourcesRef.current.delete(sourceNode);
+            if (statusRef.current !== BotStatus.ERROR && statusRef.current !== BotStatus.IDLE) {
+                setStatus(BotStatus.LISTENING);
+            }
+        };
+
+        const now = audioCtx.currentTime;
+        nextStartTimeRef.current = Math.max(nextStartTimeRef.current, now);
+        sourceNode.start(nextStartTimeRef.current);
+        nextStartTimeRef.current += greetingAudioBuffer.duration;
+        sourcesRef.current.add(sourceNode);
+    } else {
+        setStatus(BotStatus.LISTENING);
+    }
 
     scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
         const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
@@ -596,6 +765,16 @@ export const useHexaVoice = () => {
         let sum = 0.0;
         for (let i = 0; i < inputData.length; ++i) sum += inputData[i] * inputData[i];
         const rms = Math.sqrt(sum / inputData.length);
+        
+        if (rms > NOISE_THRESHOLD) {
+            lastSoundTimeRef.current = Date.now();
+            userHasSpokenRef.current = true;
+            // If we optimistically switched to thinking, but the user started speaking again, switch back.
+            if (statusRef.current === BotStatus.THINKING) {
+                setStatus(BotStatus.LISTENING);
+            }
+        }
+
         if (rms < NOISE_THRESHOLD) return;
 
         const pcmBlob = {
@@ -607,32 +786,22 @@ export const useHexaVoice = () => {
         });
     };
 
-  }, [cleanup, voice, addTranscriptEntry, updateLastBotTranscriptEntry, updateLastUserTranscriptEntry, updateConversations, executeFunctionCall]);
+  }, [cleanup, voice, addTranscriptEntry, updateLastBotTranscriptEntry, updateLastUserTranscriptEntry, updateConversations, executeFunctionCall, stopConversation, getAudioForSentence]);
 
-  const getAudioForSentence = useCallback(async (text: string, ai: GoogleGenAI): Promise<AudioBuffer | null> => {
-    if (!text.trim() || !outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') return null;
-
-    try {
-      const ttsResponse = await ai.models.generateContent({
-        model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
-        },
-      });
-
-      const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        const audioBytes = decode(base64Audio);
-        return await decodeAudioData(audioBytes, outputAudioContextRef.current, OUTPUT_SAMPLE_RATE, 1);
-      }
-      return null;
-    } catch (e) {
-      console.error("TTS generation failed for sentence:", text, e);
-      return null;
+  // Effect to auto-start conversation on load
+  useEffect(() => {
+    if (userStoppedConversation.current) return;
+  
+    const currentConvo = currentConversationId ? conversations[currentConversationId] : null;
+    if (currentConvo && status === BotStatus.IDLE) {
+      const shouldGreet = currentConvo.entries.length === 0;
+      // Use a short timeout to allow the UI to settle before asking for mic permission
+      const timer = setTimeout(() => {
+        startConversation(shouldGreet);
+      }, 500);
+      return () => clearTimeout(timer);
     }
-  }, [voice]);
+  }, [currentConversationId, conversations, status, startConversation]);
 
   const sendTextMessage = useCallback(async (message: string) => {
     if (statusRef.current !== BotStatus.IDLE) return;
@@ -640,138 +809,190 @@ export const useHexaVoice = () => {
     setStatus(BotStatus.THINKING);
     addTranscriptEntry({ source: 'user', text: message });
 
-    let ai;
-    try {
-      ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    } catch (e) {
-      setError("Failed to initialize AI. Check API Key.");
-      setStatus(BotStatus.ERROR);
-      return;
-    }
+    for (let attempt = 0; attempt <= MAX_TEXT_RETRIES; attempt++) {
+      try {
+        let ai: GoogleGenAI;
+        try {
+          ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        } catch (e) {
+          throw new Error("Failed to initialize AI. Check API Key.");
+        }
 
-    if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
-      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
-    }
-    const audioCtx = outputAudioContextRef.current;
+        if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
+          outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
+        }
+        const audioCtx = outputAudioContextRef.current;
 
-    try {
-      const currentConvo = conversationsRef.current[currentIdRef.current!];
-      const history: Content[] = (currentConvo ? currentConvo.entries : [])
-        .filter(entry => entry.type === 'message' || !entry.type)
-        .map(entry => ({
-          role: entry.source === 'user' ? 'user' : 'model',
-          parts: [{ text: entry.text }],
-        }));
+        const audioQueue = useRef<Promise<AudioBuffer | null>[]>([]).current;
+        const isPlayingAudio = useRef(false);
+        let playbackStartTime = 0;
 
-      const contents: Content[] = [...history, { role: 'user', parts: [{ text: message }] }];
+        const playAudioFromQueue = async () => {
+          if (isPlayingAudio.current || audioQueue.length === 0) return;
+          isPlayingAudio.current = true;
 
-      const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-2.5-pro',
-        contents,
-        config: { systemInstruction: SYSTEM_INSTRUCTION, tools },
-      });
-
-      let isFirstChunk = true;
-      let responseText = '';
-      const functionCalls: any[] = [];
-      
-      for await (const chunk of responseStream) {
-        const chunkText = chunk.text;
-        if (chunkText) {
-          responseText += chunkText;
-          if (isFirstChunk) {
-            addTranscriptEntry({ source: 'bot', text: chunkText });
-            isFirstChunk = false;
-          } else {
-            updateLastBotTranscriptEntry(chunkText);
+          if (audioCtx.state === 'closed') {
+              outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
           }
-        }
-        if(chunk.functionCalls) {
-          functionCalls.push(...chunk.functionCalls);
-        }
-      }
-      
-      let textToSpeak = responseText;
-      let specialType: TranscriptionEntry['type'] = 'message';
+          
+          playbackStartTime = Math.max(playbackStartTime, audioCtx.currentTime);
 
-      if (functionCalls.length > 0) {
-        const toolResponses = [];
-        for (const fc of functionCalls) {
-          const { result, name } = executeFunctionCall(fc);
-          specialType = specialTypeRef.current;
-          toolResponses.push({ toolResponse: { name, response: { result } } });
-        }
-        
-        const functionCallContent = { role: 'model', parts: functionCalls.map(fc => ({ functionCall: fc })) };
-        const toolResponseContent = { role: 'user', parts: toolResponses };
-        
-        const finalResponse = await ai.models.generateContent({
-          model: 'gemini-2.5-pro',
-          contents: [...contents, functionCallContent, toolResponseContent],
-          config: { systemInstruction: SYSTEM_INSTRUCTION, tools },
-        });
-
-        textToSpeak = finalResponse.text;
-        updateConversations(convo => {
-            const newEntries = [...convo.entries];
-            const lastEntry = newEntries[newEntries.length - 1];
-            if (lastEntry?.source === 'bot') {
-                lastEntry.text = textToSpeak;
-                lastEntry.type = specialType;
-            }
-            return { ...convo, entries: newEntries };
-        });
-        specialTypeRef.current = 'message';
-      }
-
-      if (textToSpeak) {
-        setStatus(BotStatus.SPEAKING);
-        const sentences: string[] = textToSpeak.match(/[^.!?]+[.!?]*|[^.!?]+/g) || [];
-        const filteredSentences = sentences.filter(s => s.trim());
-        
-        if (filteredSentences.length === 0) {
-          setStatus(BotStatus.IDLE);
-          return;
-        }
-
-        const audioPromises = filteredSentences.map(sentence => getAudioForSentence(sentence, ai));
-        
-        let hasPlayedAudio = false;
-        let playbackStartTime = audioCtx.currentTime;
-
-        for (const [index, promise] of audioPromises.entries()) {
-            const buffer = await promise;
-            if (buffer && audioCtx.state !== 'closed') {
-                hasPlayedAudio = true;
+          while (audioQueue.length > 0) {
+            const audioPromise = audioQueue.shift();
+            if (audioPromise) {
+              const buffer = await audioPromise;
+              if (buffer && audioCtx.state === 'running') {
                 const sourceNode = audioCtx.createBufferSource();
                 sourceNode.buffer = buffer;
                 sourceNode.connect(audioCtx.destination);
                 
-                if (index === audioPromises.length - 1) {
-                    sourceNode.onended = () => {
-                        if (statusRef.current === BotStatus.SPEAKING) setStatus(BotStatus.IDLE);
-                        sourcesRef.current.delete(sourceNode);
-                    };
-                } else {
-                    sourceNode.onended = () => sourcesRef.current.delete(sourceNode);
-                }
-
+                const onEnded = () => {
+                  sourcesRef.current.delete(sourceNode);
+                  if (sourcesRef.current.size === 0 && audioQueue.length === 0) {
+                    if (statusRef.current === BotStatus.SPEAKING) {
+                        setStatus(BotStatus.IDLE);
+                    }
+                    isPlayingAudio.current = false;
+                  }
+                };
+                sourceNode.addEventListener('ended', onEnded);
+                
                 sourceNode.start(playbackStartTime);
                 playbackStartTime += buffer.duration;
                 sourcesRef.current.add(sourceNode);
+              }
             }
-        }
+          }
+        };
+        
+        const speakTextAndFinalize = async (text: string) => {
+            const sentences: string[] = text.match(/[^.!?]+[.!?]*|[^.!?]+/g) || [];
+            const filteredSentences = sentences.filter(s => s.trim());
+            
+            if (filteredSentences.length === 0) {
+                setStatus(BotStatus.IDLE);
+                return;
+            }
 
-        if (!hasPlayedAudio) {
-            setStatus(BotStatus.IDLE);
+            setStatus(BotStatus.SPEAKING);
+            for (const sentence of filteredSentences) {
+                audioQueue.push(getAudioForSentence(sentence));
+            }
+            await playAudioFromQueue();
+        };
+
+        const currentConvo = conversationsRef.current[currentIdRef.current!];
+        const history: Content[] = (currentConvo ? currentConvo.entries : [])
+          .filter(entry => entry.type === 'message' || !entry.type)
+          .map(entry => ({ role: entry.source === 'user' ? 'user' : 'model', parts: [{ text: entry.text }] }));
+
+        const contents: Content[] = [...history, { role: 'user', parts: [{ text: message }] }];
+
+        const responseStream = await ai.models.generateContentStream({
+          model: 'gemini-2.5-pro',
+          contents,
+          config: { systemInstruction: SYSTEM_INSTRUCTION, tools },
+        });
+
+        let isFirstChunk = true;
+        let sentenceBuffer = '';
+        const functionCalls: any[] = [];
+        
+        for await (const chunk of responseStream) {
+          if (chunk.functionCalls) {
+            functionCalls.push(...chunk.functionCalls);
+            sourcesRef.current.forEach(source => source.stop());
+            sourcesRef.current.clear();
+            audioQueue.length = 0;
+            playbackStartTime = 0;
+          }
+
+          const chunkText = chunk.text;
+          if (chunkText) {
+            if (isFirstChunk) {
+              addTranscriptEntry({ source: 'bot', text: chunkText });
+              isFirstChunk = false;
+            } else {
+              updateLastBotTranscriptEntry(chunkText);
+            }
+
+            if (functionCalls.length === 0) {
+              sentenceBuffer += chunkText;
+              const sentences = sentenceBuffer.split(/(?<=[.!?])\s+/);
+              if (sentences.length > 1) {
+                const completeSentences = sentences.slice(0, -1);
+                sentenceBuffer = sentences.slice(-1)[0];
+                if (statusRef.current !== BotStatus.SPEAKING) setStatus(BotStatus.SPEAKING);
+                for (const sentence of completeSentences) {
+                  if (sentence.trim()) {
+                    audioQueue.push(getAudioForSentence(sentence.trim()));
+                  }
+                }
+                playAudioFromQueue();
+              }
+            }
+          }
         }
-      } else {
-        setStatus(BotStatus.IDLE);
+        
+        if (functionCalls.length > 0) {
+          setStatus(BotStatus.THINKING);
+          const toolResponses = [];
+          let specialType: TranscriptionEntry['type'] = 'message';
+          for (const fc of functionCalls) {
+            const { result, name } = executeFunctionCall(fc);
+            specialType = specialTypeRef.current;
+            toolResponses.push({ toolResponse: { name, response: { result } } });
+          }
+          
+          const functionCallContent = { role: 'model', parts: functionCalls.map(fc => ({ functionCall: fc })) };
+          const toolResponseContent = { role: 'user', parts: toolResponses };
+          
+          const finalResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-pro',
+            contents: [...contents, functionCallContent, toolResponseContent],
+            config: { systemInstruction: SYSTEM_INSTRUCTION, tools },
+          });
+
+          const textToSpeak = finalResponse.text;
+          updateConversations(convo => {
+              const newEntries = [...convo.entries];
+              const lastEntry = newEntries[newEntries.length - 1];
+              if (lastEntry?.source === 'bot') {
+                  lastEntry.text = textToSpeak;
+                  lastEntry.type = specialType;
+              }
+              return { ...convo, entries: newEntries };
+          });
+          specialTypeRef.current = 'message';
+          await speakTextAndFinalize(textToSpeak);
+        } else {
+          if (sentenceBuffer.trim()) {
+            audioQueue.push(getAudioForSentence(sentenceBuffer.trim()));
+            playAudioFromQueue();
+          } else if (audioQueue.length === 0 && sourcesRef.current.size === 0) {
+            setStatus(BotStatus.IDLE);
+          }
+        }
+        
+        return; // Success, exit the loop
+      } catch (e) {
+        console.error(`Error during text message processing (attempt ${attempt + 1}):`, e);
+        if (attempt < MAX_TEXT_RETRIES) {
+          setStatus(BotStatus.RECOVERING);
+          addTranscriptEntry({ source: 'bot', text: "Hmm, that didn't go as planned. Let me try that again." });
+          await new Promise(res => setTimeout(res, 2000));
+          // Remove the failed 'bot' entry and the 'recovering' message before retrying.
+          updateConversations(convo => ({
+            ...convo,
+            entries: convo.entries.slice(0, -2) 
+          }));
+          setStatus(BotStatus.THINKING);
+        } else {
+          setError("An error occurred while getting a response.");
+          setStatus(BotStatus.ERROR);
+          addTranscriptEntry({ source: 'bot', text: "I'm still running into issues. Could you please try rephrasing your message?" });
+        }
       }
-    } catch (e) {
-      console.error("Error during text message processing:", e);
-      setError("An error occurred while getting a response.");
-      setStatus(BotStatus.ERROR);
     }
   }, [addTranscriptEntry, executeFunctionCall, voice, updateLastBotTranscriptEntry, updateConversations, getAudioForSentence]);
 

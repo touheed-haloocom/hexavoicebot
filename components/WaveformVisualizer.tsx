@@ -15,6 +15,7 @@ const statusConfig = {
   [BotStatus.SPEAKING]: { color: 'rgba(192, 38, 211, 0.9)', lines: 6, freq: 0.04, amp: 40, speed: 2.5, glow: 'rgba(192, 38, 211, 0.7)' },
   [BotStatus.SINGING]: { color: 'rgba(217, 70, 239, 0.9)', lines: 8, freq: 0.05, amp: 45, speed: 2, glow: 'rgba(217, 70, 239, 0.7)' },
   [BotStatus.GENERATING_AUDIO]: { color: 'rgba(168, 85, 247, 0.9)', lines: 5, freq: 0.02, amp: 30, speed: 2, glow: 'rgba(168, 85, 247, 0.7)' },
+  [BotStatus.RECOVERING]: { color: 'rgba(251, 146, 60, 0.9)', lines: 5, freq: 0.03, amp: 30, speed: 3, glow: 'rgba(251, 146, 60, 0.6)' },
   [BotStatus.ERROR]: { color: 'rgba(239, 68, 68, 0.8)', lines: 1, freq: 0, amp: 0, speed: 0, glow: 'rgba(239, 68, 68, 0.5)' },
 };
 
@@ -115,7 +116,7 @@ export const WaveformVisualizer: React.FC<WaveformVisualizerProps> = ({ status, 
       aria-label={status === BotStatus.IDLE ? "Start conversation" : "Stop conversation"}
     >
       <div
-        className={`absolute inset-0 rounded-full transition-all duration-500 ${status === BotStatus.LISTENING || status === BotStatus.THINKING || status === BotStatus.SINGING || status === BotStatus.GENERATING_AUDIO ? 'animate-pulse-glow' : ''}`}
+        className={`absolute inset-0 rounded-full transition-all duration-500 ${status === BotStatus.LISTENING || status === BotStatus.THINKING || status === BotStatus.SINGING || status === BotStatus.GENERATING_AUDIO || status === BotStatus.RECOVERING ? 'animate-pulse-glow' : ''}`}
         style={{
           boxShadow: `0 0 40px 10px ${glowConfig.glow}`,
           filter: `blur(5px)`,

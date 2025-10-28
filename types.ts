@@ -7,6 +7,7 @@ export enum BotStatus {
   ERROR = 'error',
   SINGING = 'singing',
   GENERATING_AUDIO = 'generating_audio',
+  RECOVERING = 'recovering',
 }
 
 export interface TranscriptionEntry {
